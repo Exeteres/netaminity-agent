@@ -20,6 +20,12 @@ pub const MAX_FRAME_LENGTH: usize = 256;
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Interval between reliability checks.
+pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Number of consecutive tunnel probe failures before restarting both agents.
+pub const HEALTH_FAILURE_THRESHOLD: u8 = 3;
+
 /// A message from the client on the control connection.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -31,6 +37,9 @@ pub enum ClientMessage {
 
     /// Accepts an incoming TCP connection, using this stream as a proxy.
     Accept(Uuid),
+
+    /// Acknowledges a health check and reports cached backend reachability.
+    Health(Uuid, bool),
 }
 
 /// A message from the server on the control connection.
@@ -44,6 +53,12 @@ pub enum ServerMessage {
 
     /// No-op used to test if the client is still reachable.
     Heartbeat,
+
+    /// Checks control liveness and requests cached target backend health.
+    HealthCheck(Uuid),
+
+    /// Requests a coordinated restart after tunnel integrity failure.
+    Restart,
 
     /// Asks the client to accept a forwarded TCP connection.
     Connection(Uuid),

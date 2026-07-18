@@ -39,6 +39,39 @@ async fn spawn_client(secret: Option<&str>) -> Result<(TcpListener, SocketAddr)>
     Ok((listener, remote_addr))
 }
 
+async fn unused_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    Ok(listener.local_addr()?.port())
+}
+
+async fn http_status(port: u16, path: &str) -> Result<u16> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let response = String::from_utf8(response)?;
+    Ok(response
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow!("missing HTTP status"))?
+        .parse()?)
+}
+
+async fn wait_for_status(port: u16, path: &str, expected: u16) -> Result<()> {
+    time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(http_status(port, path).await, Ok(status) if status == expected) {
+                return;
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
 #[rstest]
 #[tokio::test]
 async fn basic_proxy(#[values(None, Some(""), Some("abc"))] secret: Option<&str>) -> Result<()> {
@@ -177,5 +210,56 @@ async fn half_closed_tcp_stream() -> Result<()> {
     // part of the TCP protocol, just the POSIX streams API. It is implemented by
     // the OS ignoring future packets received on that stream.
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn reliable_health_distinguishes_backend_failure() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let control_port = unused_port().await?;
+    let proxy_port = unused_port().await?;
+    let proxy_health_port = unused_port().await?;
+    let target_health_port = unused_port().await?;
+    let backend = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend.local_addr()?.port();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let _ = backend.accept().await;
+        }
+    });
+
+    let mut server = Server::new(proxy_port..=proxy_port, None);
+    server.set_bind_addr("127.0.0.1".parse()?);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_control_port(control_port);
+    server.set_reliable(true);
+    server.set_health_addr(([127, 0, 0, 1], proxy_health_port).into());
+    let server_task = tokio::spawn(server.listen());
+    time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = Client::new(
+        "127.0.0.1",
+        backend_port,
+        "127.0.0.1",
+        proxy_port,
+        None,
+        control_port,
+    )
+    .await?;
+    client.set_reliable(true);
+    client.set_health_addr(([127, 0, 0, 1], target_health_port).into());
+    let client_task = tokio::spawn(client.listen());
+
+    wait_for_status(proxy_health_port, "/ready", 200).await?;
+    wait_for_status(target_health_port, "/ready", 200).await?;
+
+    backend_task.abort();
+    wait_for_status(proxy_health_port, "/ready", 503).await?;
+    wait_for_status(target_health_port, "/ready", 503).await?;
+    assert_eq!(http_status(proxy_health_port, "/live").await?, 200);
+    assert_eq!(http_status(target_health_port, "/live").await?, 200);
+
+    client_task.abort();
+    server_task.abort();
     Ok(())
 }

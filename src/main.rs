@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::Result;
 use bore_cli::{client::Client, server::Server};
@@ -38,6 +38,14 @@ enum Command {
         /// TCP port used for control connections with the server.
         #[clap(long, default_value_t = 7835, env = "BORE_CONTROL_PORT")]
         control_port: u16,
+
+        /// Enable tunnel integrity checks and restart behavior.
+        #[clap(long)]
+        reliable: bool,
+
+        /// Address serving /live, /ready, and /status.
+        #[clap(long)]
+        health_addr: Option<SocketAddr>,
     },
 
     /// Runs the remote proxy server.
@@ -65,6 +73,14 @@ enum Command {
         /// TCP port used for control connections with clients.
         #[clap(long, default_value_t = 7835, env = "BORE_CONTROL_PORT")]
         control_port: u16,
+
+        /// Enable tunnel integrity checks and restart behavior.
+        #[clap(long)]
+        reliable: bool,
+
+        /// Address serving /live, /ready, and /status.
+        #[clap(long)]
+        health_addr: Option<SocketAddr>,
     },
 }
 
@@ -78,8 +94,10 @@ async fn run(command: Command) -> Result<()> {
             port,
             secret,
             control_port,
+            reliable,
+            health_addr,
         } => {
-            let client = Client::new(
+            let mut client = Client::new(
                 &local_host,
                 local_port,
                 &to,
@@ -88,6 +106,10 @@ async fn run(command: Command) -> Result<()> {
                 control_port,
             )
             .await?;
+            client.set_reliable(reliable);
+            if let Some(addr) = health_addr {
+                client.set_health_addr(addr);
+            }
             client.listen().await?;
         }
         Command::Server {
@@ -97,6 +119,8 @@ async fn run(command: Command) -> Result<()> {
             bind_addr,
             bind_tunnels,
             control_port,
+            reliable,
+            health_addr,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -108,6 +132,10 @@ async fn run(command: Command) -> Result<()> {
             server.set_bind_addr(bind_addr);
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
             server.set_control_port(control_port);
+            server.set_reliable(reliable);
+            if let Some(addr) = health_addr {
+                server.set_health_addr(addr);
+            }
             server.listen().await?;
         }
     }

@@ -17,5 +17,6 @@
 
 pub mod auth;
 pub mod client;
+pub mod health;
 pub mod server;
 pub mod shared;

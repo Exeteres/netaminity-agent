@@ -8,28 +8,29 @@ This project is a fork of [ekzhang/bore](https://github.com/ekzhang/bore). Refer
 
 - Applies upstream PR [ekzhang/bore#189](https://github.com/ekzhang/bore/pull/189), adding configurable control-port support.
 - Adds `--control-port` and `BORE_CONTROL_PORT` for both `bore local` and `bore server`.
+- Adds opt-in tunnel integrity checks and HTTP health endpoints. See [Reliability](docs/RELIABILITY.md).
 - Publishes container images to GitHub Container Registry under `ghcr.io/exeteres/netaminity-agent`.
 
 ## Versions
 
 Fork releases use the version format `{original-version}-na.{counter}`.
 
-Current version: `0.6.0-na.1`
+Current version: `0.6.0-na.2`
 
-Example tag: `v0.6.0-na.1`
+Example tag: `v0.6.0-na.2`
 
 ## Images
 
 Container image:
 
 ```shell
-ghcr.io/exeteres/netaminity-agent:0.6.0-na.1
+ghcr.io/exeteres/netaminity-agent:0.6.0-na.2
 ```
 
 Run the image:
 
 ```shell
-docker run -it --init --rm --network host ghcr.io/exeteres/netaminity-agent:0.6.0-na.1 <ARGS>
+docker run -it --init --rm --network host ghcr.io/exeteres/netaminity-agent:0.6.0-na.2 <ARGS>
 ```
 
 Release images are built by `.github/workflows/docker.yml` for tags matching `v*.*.*-na.*`.

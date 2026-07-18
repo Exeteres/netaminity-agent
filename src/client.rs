@@ -1,5 +1,6 @@
 //! Client implementation for the `bore` service.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -8,7 +9,10 @@ use tracing::{error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, NETWORK_TIMEOUT};
+use crate::health::{serve as serve_health, HealthState};
+use crate::shared::{
+    ClientMessage, Delimited, ServerMessage, HEALTH_CHECK_INTERVAL, NETWORK_TIMEOUT,
+};
 
 /// State structure for the client.
 pub struct Client {
@@ -32,6 +36,15 @@ pub struct Client {
 
     /// TCP port used for control connections with the server.
     control_port: u16,
+
+    /// Enable Netaminity reliability behavior.
+    reliable: bool,
+
+    /// Address serving local HTTP health endpoints.
+    health_addr: Option<SocketAddr>,
+
+    /// Current tunnel health.
+    health: Arc<HealthState>,
 }
 
 impl Client {
@@ -71,7 +84,20 @@ impl Client {
             remote_port,
             auth,
             control_port,
+            reliable: false,
+            health_addr: None,
+            health: HealthState::new(),
         })
+    }
+
+    /// Enable reliability checks and restart behavior.
+    pub fn set_reliable(&mut self, reliable: bool) {
+        self.reliable = reliable;
+    }
+
+    /// Set the address serving HTTP health endpoints.
+    pub fn set_health_addr(&mut self, health_addr: SocketAddr) {
+        self.health_addr = Some(health_addr);
     }
 
     /// Returns the port publicly available on the remote.
@@ -81,13 +107,83 @@ impl Client {
 
     /// Start the client, listening for new connections.
     pub async fn listen(mut self) -> Result<()> {
+        self.health.set_control_connected(true);
+        info!(
+            proxy_host = %self.to,
+            proxy_port = self.control_port,
+            backend_host = %self.local_host,
+            backend_port = self.local_port,
+            reliable = self.reliable,
+            "target control session established"
+        );
+        if let Some(addr) = self.health_addr {
+            let health = Arc::clone(&self.health);
+            tokio::spawn(async move {
+                if let Err(err) = serve_health(addr, "target", health).await {
+                    error!(%err, "health server exited");
+                }
+            });
+        }
         let mut conn = self.conn.take().unwrap();
         let this = Arc::new(self);
+        if this.reliable {
+            let this = Arc::clone(&this);
+            tokio::spawn(async move {
+                let mut checks = tokio::time::interval(HEALTH_CHECK_INTERVAL);
+                let mut previous = None;
+                loop {
+                    checks.tick().await;
+                    let reachable = connect_with_timeout(&this.local_host, this.local_port)
+                        .await
+                        .is_ok();
+                    this.health.set_backend_reachable(reachable);
+                    if previous != Some(reachable) {
+                        if reachable {
+                            info!(
+                                backend_host = %this.local_host,
+                                backend_port = this.local_port,
+                                "target backend became reachable"
+                            );
+                        } else {
+                            warn!(
+                                backend_host = %this.local_host,
+                                backend_port = this.local_port,
+                                "target backend became unreachable"
+                            );
+                        }
+                        previous = Some(reachable);
+                    }
+                }
+            });
+        }
         loop {
-            match conn.recv().await? {
+            let message = match conn.recv().await {
+                Ok(message) => message,
+                Err(err) => {
+                    this.health.set_control_connected(false);
+                    if this.reliable {
+                        this.health.fail_liveness();
+                    }
+                    error!(%err, reliable = this.reliable, "target control session failed");
+                    return Err(err);
+                }
+            };
+            match message {
                 Some(ServerMessage::Hello(_)) => warn!("unexpected hello"),
                 Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                 Some(ServerMessage::Heartbeat) => (),
+                Some(ServerMessage::HealthCheck(nonce)) => {
+                    conn.send(ClientMessage::Health(
+                        nonce,
+                        this.health.backend_reachable(),
+                    ))
+                    .await?;
+                }
+                Some(ServerMessage::Restart) => {
+                    this.health.fail_liveness();
+                    error!("proxy requested coordinated restart");
+                    bail!("server requested restart after tunnel integrity failure");
+                }
                 Some(ServerMessage::Connection(id)) => {
                     let this = Arc::clone(&this);
                     tokio::spawn(
@@ -102,7 +198,16 @@ impl Client {
                     );
                 }
                 Some(ServerMessage::Error(err)) => error!(%err, "server error"),
-                None => return Ok(()),
+                None => {
+                    this.health.set_control_connected(false);
+                    if this.reliable {
+                        this.health.fail_liveness();
+                        error!("target control session closed; failing liveness");
+                        bail!("control connection closed");
+                    }
+                    info!("target control session closed");
+                    return Ok(());
+                }
             }
         }
     }
@@ -113,8 +218,8 @@ impl Client {
         if let Some(auth) = &self.auth {
             auth.client_handshake(&mut remote_conn).await?;
         }
-        remote_conn.send(ClientMessage::Accept(id)).await?;
         let mut local_conn = connect_with_timeout(&self.local_host, self.local_port).await?;
+        remote_conn.send(ClientMessage::Accept(id)).await?;
         let mut parts = remote_conn.into_parts();
         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
         local_conn.write_all(&parts.read_buf).await?; // mostly of the cases, this will be empty

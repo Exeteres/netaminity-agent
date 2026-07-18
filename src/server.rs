@@ -1,18 +1,23 @@
 //! Server implementation for the `bore` service.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, timeout};
-use tracing::{info, info_span, warn, Instrument};
+use tokio::sync::oneshot;
+use tokio::time::{interval, sleep, timeout};
+use tracing::{error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, DEFAULT_CONTROL_PORT};
+use crate::health::{serve as serve_health, HealthState};
+use crate::shared::{
+    ClientMessage, Delimited, ServerMessage, DEFAULT_CONTROL_PORT, HEALTH_CHECK_INTERVAL,
+    HEALTH_FAILURE_THRESHOLD, NETWORK_TIMEOUT,
+};
 
 /// State structure for the server.
 pub struct Server {
@@ -33,6 +38,18 @@ pub struct Server {
 
     /// TCP port used for control connections with clients.
     control_port: u16,
+
+    /// Enable Netaminity reliability behavior.
+    reliable: bool,
+
+    /// Address serving local HTTP health endpoints.
+    health_addr: Option<SocketAddr>,
+
+    /// Current tunnel health.
+    health: Arc<HealthState>,
+
+    /// Pending synthetic tunnel probes.
+    probes: Arc<DashMap<Uuid, oneshot::Sender<()>>>,
 }
 
 impl Server {
@@ -46,6 +63,10 @@ impl Server {
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             control_port: DEFAULT_CONTROL_PORT,
+            reliable: false,
+            health_addr: None,
+            health: HealthState::new(),
+            probes: Arc::new(DashMap::new()),
         }
     }
 
@@ -64,8 +85,26 @@ impl Server {
         self.control_port = control_port;
     }
 
+    /// Enable reliability checks and restart behavior.
+    pub fn set_reliable(&mut self, reliable: bool) {
+        self.reliable = reliable;
+    }
+
+    /// Set the address serving HTTP health endpoints.
+    pub fn set_health_addr(&mut self, health_addr: SocketAddr) {
+        self.health_addr = Some(health_addr);
+    }
+
     /// Start the server, listening for new connections.
     pub async fn listen(self) -> Result<()> {
+        if let Some(addr) = self.health_addr {
+            let health = Arc::clone(&self.health);
+            tokio::spawn(async move {
+                if let Err(err) = serve_health(addr, "proxy", health).await {
+                    error!(%err, "health server exited");
+                }
+            });
+        }
         let this = Arc::new(self);
         let listener = TcpListener::bind((this.bind_addr, this.control_port)).await?;
         info!(addr = ?this.bind_addr, port = this.control_port, "server listening");
@@ -152,6 +191,21 @@ impl Server {
                 info!(?host, ?port, "new client");
                 stream.send(ServerMessage::Hello(port)).await?;
 
+                if self.reliable {
+                    self.health.set_control_connected(true);
+                    info!(?host, ?port, "reliable target control session established");
+                    let result = self.reliable_session(&mut stream, &listener).await;
+                    self.health.set_control_connected(false);
+                    self.health.fail_liveness();
+                    match &result {
+                        Err(err) => {
+                            error!(error = %err, "reliable target control session failed; failing liveness")
+                        }
+                        Ok(()) => warn!("reliable target control session closed; failing liveness"),
+                    }
+                    return result;
+                }
+
                 loop {
                     if stream.send(ServerMessage::Heartbeat).await.is_err() {
                         // Assume that the TCP connection has been dropped.
@@ -179,6 +233,10 @@ impl Server {
             }
             Some(ClientMessage::Accept(id)) => {
                 info!(%id, "forwarding connection");
+                if let Some((_, completed)) = self.probes.remove(&id) {
+                    let _ = completed.send(());
+                    return Ok(());
+                }
                 match self.conns.remove(&id) {
                     Some((_, mut stream2)) => {
                         let mut parts = stream.into_parts();
@@ -191,6 +249,154 @@ impl Server {
                 Ok(())
             }
             None => Ok(()),
+            Some(ClientMessage::Health(_, _)) => {
+                warn!("unexpected health report");
+                Ok(())
+            }
         }
     }
+
+    async fn reliable_session(
+        &self,
+        stream: &mut Delimited<TcpStream>,
+        listener: &TcpListener,
+    ) -> Result<()> {
+        let mut checks = interval(HEALTH_CHECK_INTERVAL);
+        let mut control_failures = 0;
+        let mut tunnel_failures = 0;
+        let mut previous_backend = None;
+        let mut tunnel_verified = false;
+        loop {
+            tokio::select! {
+                _ = checks.tick() => {
+                    let nonce = Uuid::new_v4();
+                    stream.send(ServerMessage::HealthCheck(nonce)).await?;
+                    let backend_reachable = match receive_health(stream, nonce).await {
+                        Ok(Some(reachable)) => {
+                            if control_failures > 0 {
+                                info!(previous_failures = control_failures, "control health recovered");
+                            }
+                            control_failures = 0;
+                            self.health.set_control_connected(true);
+                            reachable
+                        }
+                        Ok(None) => bail!("control connection closed"),
+                        Err(err) => {
+                            control_failures += 1;
+                            warn!(control_failures, %err, "control health check failed");
+                            self.health.set_control_connected(false);
+                            if control_failures >= HEALTH_FAILURE_THRESHOLD {
+                                self.health.fail_liveness();
+                                send_restart(stream, "control health failure").await;
+                                bail!("control health failed after {control_failures} checks");
+                            }
+                            continue;
+                        }
+                    };
+                    self.health.set_backend_reachable(backend_reachable);
+                    if previous_backend != Some(backend_reachable) {
+                        if backend_reachable {
+                            info!("target reports backend reachable");
+                        } else {
+                            warn!("target reports backend unreachable; suppressing restart-worthy tunnel probes");
+                        }
+                        previous_backend = Some(backend_reachable);
+                    }
+
+                    if !backend_reachable {
+                        tunnel_failures = 0;
+                        tunnel_verified = false;
+                        continue;
+                    }
+
+                    let listener_addr = listener.local_addr()?;
+                    let probe_addr = SocketAddr::new(
+                        match listener_addr.ip() {
+                            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                            ip => ip,
+                        },
+                        listener_addr.port(),
+                    );
+                    let (probe_connection, (incoming, _)) = tokio::try_join!(
+                        TcpStream::connect(probe_addr),
+                        listener.accept(),
+                    )?;
+                    let id = Uuid::new_v4();
+                    let (completed, completion) = oneshot::channel();
+                    self.probes.insert(id, completed);
+                    stream.send(ServerMessage::Connection(id)).await?;
+                    match timeout(NETWORK_TIMEOUT, completion).await {
+                        Ok(Ok(())) => {
+                            if !tunnel_verified {
+                                info!(consumer_port = listener.local_addr()?.port(), previous_failures = tunnel_failures, "end-to-end tunnel verified");
+                            }
+                            tunnel_failures = 0;
+                            tunnel_verified = true;
+                            self.health.set_tunnel_verified(true);
+                        }
+                        _ => {
+                            self.probes.remove(&id);
+                            tunnel_failures += 1;
+                            tunnel_verified = false;
+                            self.health.set_tunnel_verified(false);
+                            warn!(tunnel_failures, "end-to-end tunnel probe failed");
+                            if tunnel_failures >= HEALTH_FAILURE_THRESHOLD {
+                                self.health.fail_liveness();
+                                send_restart(stream, "end-to-end tunnel failure").await;
+                                bail!("tunnel integrity failed after {tunnel_failures} probes");
+                            }
+                        }
+                    }
+                    drop(incoming);
+                    drop(probe_connection);
+                }
+                result = listener.accept() => {
+                    let (incoming, addr) = result?;
+                    info!(?addr, "new connection");
+                    let id = Uuid::new_v4();
+                    self.conns.insert(id, incoming);
+                    let conns = Arc::clone(&self.conns);
+                    tokio::spawn(async move {
+                        sleep(Duration::from_secs(10)).await;
+                        if conns.remove(&id).is_some() {
+                            warn!(%id, "removed stale connection");
+                        }
+                    });
+                    stream.send(ServerMessage::Connection(id)).await?;
+                }
+            }
+        }
+    }
+}
+
+async fn send_restart(stream: &mut Delimited<TcpStream>, reason: &'static str) {
+    match stream.send(ServerMessage::Restart).await {
+        Ok(()) => error!(%reason, "requested coordinated target restart"),
+        Err(err) => {
+            error!(%reason, %err, "failed to request target restart; control loss is the fallback")
+        }
+    }
+}
+
+async fn receive_health(
+    stream: &mut Delimited<TcpStream>,
+    expected_nonce: Uuid,
+) -> Result<Option<bool>> {
+    timeout(NETWORK_TIMEOUT, async {
+        loop {
+            match stream.recv().await? {
+                Some(ClientMessage::Health(nonce, reachable)) if nonce == expected_nonce => {
+                    return Ok(Some(reachable));
+                }
+                Some(ClientMessage::Health(nonce, _)) => {
+                    warn!(%nonce, %expected_nonce, "ignored stale control health response");
+                }
+                Some(message) => bail!("unexpected reliability message: {message:?}"),
+                None => return Ok(None),
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for control health response")?
 }
