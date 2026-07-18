@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use bore_cli::{client::Client, server::Server, shared::CONTROL_PORT};
+use bore_cli::{client::Client, server::Server, shared::DEFAULT_CONTROL_PORT};
 use lazy_static::lazy_static;
 use rstest::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,7 +25,15 @@ async fn spawn_server(secret: Option<&str>) {
 async fn spawn_client(secret: Option<&str>) -> Result<(TcpListener, SocketAddr)> {
     let listener = TcpListener::bind("localhost:0").await?;
     let local_port = listener.local_addr()?.port();
-    let client = Client::new("localhost", local_port, "localhost", 0, secret).await?;
+    let client = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        0,
+        secret,
+        DEFAULT_CONTROL_PORT,
+    )
+    .await?;
     let remote_addr = ([127, 0, 0, 1], client.remote_port()).into();
     tokio::spawn(client.listen());
     Ok((listener, remote_addr))
@@ -84,7 +92,16 @@ async fn mismatched_secret(
 async fn invalid_address() -> Result<()> {
     // We don't need the serial guard for this test because it doesn't create a server.
     async fn check_address(to: &str, use_secret: bool) -> Result<()> {
-        match Client::new("localhost", 5000, to, 0, use_secret.then_some("a secret")).await {
+        match Client::new(
+            "localhost",
+            5000,
+            to,
+            0,
+            use_secret.then_some("a secret"),
+            DEFAULT_CONTROL_PORT,
+        )
+        .await
+        {
             Ok(_) => Err(anyhow!("expected error for {to}, use_secret={use_secret}")),
             Err(_) => Ok(()),
         }
@@ -105,7 +122,7 @@ async fn very_long_frame() -> Result<()> {
     let _guard = SERIAL_GUARD.lock().await;
 
     spawn_server(None).await;
-    let mut attacker = TcpStream::connect(("localhost", CONTROL_PORT)).await?;
+    let mut attacker = TcpStream::connect(("localhost", DEFAULT_CONTROL_PORT)).await?;
 
     // Slowly send a very long frame.
     for _ in 0..10 {

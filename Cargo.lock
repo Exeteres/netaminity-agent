@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "bore-cli"
-version = "0.6.0"
+version = "0.6.0-na.1"
 dependencies = [
  "anyhow",
  "clap",
