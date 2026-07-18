@@ -14,11 +14,7 @@ Refer to the upstream repository for the original project documentation and base
 
 ## Versions
 
-Fork releases use the version format `{original-version}-na.{counter}`.
-
-Current version: `0.6.0-na.2`
-
-Example tag: `v0.6.0-na.2`
+Fork releases use the version format `{original-version}-na.{counter}`. Current version: `0.6.0-na.2`
 
 ## Images
 
