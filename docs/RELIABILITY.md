@@ -1,6 +1,6 @@
 # Reliability
 
-Netaminity runs both agent roles with `--reliable --health-addr 0.0.0.0:8080`. Reliable mode distinguishes an unavailable target dependency from a broken tunnel so Kubernetes only restarts agents when restarting can repair the path.
+[Netaminity](https://github.com/exeteres/netaminity) runs both agent roles with `--reliable --health-addr 0.0.0.0:8080`. Reliable mode distinguishes an unavailable target dependency from a broken tunnel so Kubernetes only restarts agents when restarting can repair the path.
 
 ## Health Endpoints
 

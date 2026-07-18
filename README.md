@@ -2,7 +2,8 @@
 
 [![Build status](https://img.shields.io/github/actions/workflow/status/exeteres/netaminity-agent/ci.yml)](https://github.com/exeteres/netaminity-agent/actions)
 
-This project is a fork of [ekzhang/bore](https://github.com/ekzhang/bore). Refer to the upstream repository for the original project documentation and baseline behavior.
+This project is a fork of [ekzhang/bore](https://github.com/ekzhang/bore) made mostly for [netaminity](https://github.com/exeteres/netaminity) project, while you can still use it as a standalone tool.
+Refer to the upstream repository for the original project documentation and baseline behavior.
 
 ## Fork Changes
 
