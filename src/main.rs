@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use anyhow::Result;
 use bore_cli::{client::Client, server::Server};
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
+use tracing::info;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -86,6 +87,17 @@ enum Command {
 
 #[tokio::main]
 async fn run(command: Command) -> Result<()> {
+    tokio::select! {
+        result = run_command(command) => result,
+        result = shutdown_signal() => {
+            result?;
+            info!("received termination signal; shutting down");
+            Ok(())
+        }
+    }
+}
+
+async fn run_command(command: Command) -> Result<()> {
     match command {
         Command::Local {
             local_host,
@@ -140,6 +152,24 @@ async fn run(command: Command) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => (),
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
