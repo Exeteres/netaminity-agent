@@ -17,14 +17,29 @@ pub const DEFAULT_CONTROL_PORT: u16 = 7835;
 /// Maximum byte length for a JSON frame in the stream.
 pub const MAX_FRAME_LENGTH: usize = 256;
 
-/// Timeout for network connections and initial protocol messages.
+/// Timeout for establishing one TCP connection.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for authentication and initial protocol messages.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum duration of one complete control connection attempt.
+pub const CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Timeout for an established-session health operation.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Interval between reliability checks.
-pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Number of consecutive tunnel probe failures before restarting both agents.
-pub const HEALTH_FAILURE_THRESHOLD: u8 = 3;
+/// Interval between direct Target backend checks.
+pub const BACKEND_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Number of consecutive control failures before closing the session.
+pub const CONTROL_FAILURE_THRESHOLD: u8 = 2;
+
+/// Number of consecutive tunnel probe failures before closing the session.
+pub const TUNNEL_FAILURE_THRESHOLD: u8 = 3;
 
 /// A message from the client on the control connection.
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,8 +72,8 @@ pub enum ServerMessage {
     /// Checks control liveness and requests cached target backend health.
     HealthCheck(Uuid),
 
-    /// Requests a coordinated restart after tunnel integrity failure.
-    Restart,
+    /// Verifies a synthetic data connection without forwarding application bytes.
+    TunnelProbe(Uuid),
 
     /// Asks the client to accept a forwarded TCP connection.
     Connection(Uuid),
@@ -95,7 +110,7 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
     /// This is useful for parsing the initial message of a stream for handshake or
     /// other protocol purposes, where we do not want to wait indefinitely.
     pub async fn recv_timeout<T: DeserializeOwned>(&mut self) -> Result<Option<T>> {
-        timeout(NETWORK_TIMEOUT, self.recv())
+        timeout(HANDSHAKE_TIMEOUT, self.recv())
             .await
             .context("timed out waiting for initial message")?
     }

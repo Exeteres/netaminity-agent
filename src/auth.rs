@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::shared::{ClientMessage, Delimited, ServerMessage};
 
 /// Wrapper around a MAC used for authenticating clients that have a secret.
+#[derive(Clone)]
 pub struct Authenticator(Hmac<Sha256>);
 
 impl Authenticator {

@@ -9,14 +9,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::time::{interval, sleep, timeout};
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
 use crate::health::{serve as serve_health, HealthState};
 use crate::shared::{
-    ClientMessage, Delimited, ServerMessage, DEFAULT_CONTROL_PORT, HEALTH_CHECK_INTERVAL,
-    HEALTH_FAILURE_THRESHOLD, NETWORK_TIMEOUT,
+    ClientMessage, Delimited, ServerMessage, CONTROL_FAILURE_THRESHOLD, DEFAULT_CONTROL_PORT,
+    HEALTH_CHECK_INTERVAL, NETWORK_TIMEOUT, TUNNEL_FAILURE_THRESHOLD,
 };
 
 /// State structure for the server.
@@ -85,7 +85,7 @@ impl Server {
         self.control_port = control_port;
     }
 
-    /// Enable reliability checks and restart behavior.
+    /// Enable health checks and automatic session recovery.
     pub fn set_reliable(&mut self, reliable: bool) {
         self.reliable = reliable;
     }
@@ -114,11 +114,11 @@ impl Server {
             let this = Arc::clone(&this);
             tokio::spawn(
                 async move {
-                    info!("incoming connection");
+                    debug!("incoming control connection");
                     if let Err(err) = this.handle_connection(stream).await {
-                        warn!(%err, "connection exited with error");
+                        warn!(%err, "control connection handler failed");
                     } else {
-                        info!("connection exited");
+                        debug!("control connection closed");
                     }
                 }
                 .instrument(info_span!("control", ?addr)),
@@ -196,12 +196,9 @@ impl Server {
                     info!(?host, ?port, "reliable target control session established");
                     let result = self.reliable_session(&mut stream, &listener).await;
                     self.health.set_control_connected(false);
-                    self.health.fail_liveness();
                     match &result {
-                        Err(err) => {
-                            error!(error = %err, "reliable target control session failed; failing liveness")
-                        }
-                        Ok(()) => warn!("reliable target control session closed; failing liveness"),
+                        Err(err) => warn!(error = %err, "reliable target control session failed"),
+                        Ok(()) => info!("reliable target control session closed"),
                     }
                     return result;
                 }
@@ -232,17 +229,31 @@ impl Server {
                 }
             }
             Some(ClientMessage::Accept(id)) => {
-                info!(%id, "forwarding connection");
                 if let Some((_, completed)) = self.probes.remove(&id) {
+                    debug!(%id, "tunnel probe accepted");
                     let _ = completed.send(());
                     return Ok(());
                 }
+                info!(%id, "forwarding connection accepted");
                 match self.conns.remove(&id) {
                     Some((_, mut stream2)) => {
                         let mut parts = stream.into_parts();
                         debug_assert!(parts.write_buf.is_empty(), "framed write buffer not empty");
                         stream2.write_all(&parts.read_buf).await?;
-                        tokio::io::copy_bidirectional(&mut parts.io, &mut stream2).await?;
+                        match tokio::io::copy_bidirectional(&mut parts.io, &mut stream2).await {
+                            Ok((target_to_consumer, consumer_to_target)) => info!(
+                                %id,
+                                target_to_consumer,
+                                consumer_to_target,
+                                "forwarding connection closed"
+                            ),
+                            Err(err) if is_peer_reset(&err) => info!(
+                                %id,
+                                %err,
+                                "forwarding connection closed by peer"
+                            ),
+                            Err(err) => return Err(err.into()),
+                        }
                     }
                     None => warn!(%id, "missing connection"),
                 }
@@ -285,10 +296,8 @@ impl Server {
                             control_failures += 1;
                             warn!(control_failures, %err, "control health check failed");
                             self.health.set_control_connected(false);
-                            if control_failures >= HEALTH_FAILURE_THRESHOLD {
-                                self.health.fail_liveness();
-                                send_restart(stream, "control health failure").await;
-                                bail!("control health failed after {control_failures} checks");
+                            if control_failures >= CONTROL_FAILURE_THRESHOLD {
+                                bail!("control session unhealthy after {control_failures} checks");
                             }
                             continue;
                         }
@@ -298,7 +307,7 @@ impl Server {
                         if backend_reachable {
                             info!("target reports backend reachable");
                         } else {
-                            warn!("target reports backend unreachable; suppressing restart-worthy tunnel probes");
+                            warn!("target reports backend unreachable; retaining control session");
                         }
                         previous_backend = Some(backend_reachable);
                     }
@@ -318,14 +327,19 @@ impl Server {
                         },
                         listener_addr.port(),
                     );
-                    let (probe_connection, (incoming, _)) = tokio::try_join!(
-                        TcpStream::connect(probe_addr),
-                        listener.accept(),
-                    )?;
+                    let probe_connection = TcpStream::connect(probe_addr).await?;
+                    let probe_source = probe_connection.local_addr()?;
+                    let incoming = loop {
+                        let (incoming, addr) = listener.accept().await?;
+                        if addr == probe_source {
+                            break incoming;
+                        }
+                        self.forward_connection(stream, incoming, addr).await?;
+                    };
                     let id = Uuid::new_v4();
                     let (completed, completion) = oneshot::channel();
                     self.probes.insert(id, completed);
-                    stream.send(ServerMessage::Connection(id)).await?;
+                    stream.send(ServerMessage::TunnelProbe(id)).await?;
                     match timeout(NETWORK_TIMEOUT, completion).await {
                         Ok(Ok(())) => {
                             if !tunnel_verified {
@@ -341,10 +355,8 @@ impl Server {
                             tunnel_verified = false;
                             self.health.set_tunnel_verified(false);
                             warn!(tunnel_failures, "end-to-end tunnel probe failed");
-                            if tunnel_failures >= HEALTH_FAILURE_THRESHOLD {
-                                self.health.fail_liveness();
-                                send_restart(stream, "end-to-end tunnel failure").await;
-                                bail!("tunnel integrity failed after {tunnel_failures} probes");
+                            if tunnel_failures >= TUNNEL_FAILURE_THRESHOLD {
+                                bail!("tunnel session unhealthy after {tunnel_failures} probes");
                             }
                         }
                     }
@@ -353,29 +365,29 @@ impl Server {
                 }
                 result = listener.accept() => {
                     let (incoming, addr) = result?;
-                    info!(?addr, "new connection");
-                    let id = Uuid::new_v4();
-                    self.conns.insert(id, incoming);
-                    let conns = Arc::clone(&self.conns);
-                    tokio::spawn(async move {
-                        sleep(Duration::from_secs(10)).await;
-                        if conns.remove(&id).is_some() {
-                            warn!(%id, "removed stale connection");
-                        }
-                    });
-                    stream.send(ServerMessage::Connection(id)).await?;
+                    self.forward_connection(stream, incoming, addr).await?;
                 }
             }
         }
     }
-}
 
-async fn send_restart(stream: &mut Delimited<TcpStream>, reason: &'static str) {
-    match stream.send(ServerMessage::Restart).await {
-        Ok(()) => error!(%reason, "requested coordinated target restart"),
-        Err(err) => {
-            error!(%reason, %err, "failed to request target restart; control loss is the fallback")
-        }
+    async fn forward_connection(
+        &self,
+        stream: &mut Delimited<TcpStream>,
+        incoming: TcpStream,
+        consumer_addr: SocketAddr,
+    ) -> Result<()> {
+        let id = Uuid::new_v4();
+        info!(%id, %consumer_addr, "consumer connection accepted");
+        self.conns.insert(id, incoming);
+        let conns = Arc::clone(&self.conns);
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(10)).await;
+            if conns.remove(&id).is_some() {
+                warn!(%id, %consumer_addr, "consumer connection was not accepted by target");
+            }
+        });
+        stream.send(ServerMessage::Connection(id)).await
     }
 }
 
@@ -399,4 +411,11 @@ async fn receive_health(
     })
     .await
     .context("timed out waiting for control health response")?
+}
+
+fn is_peer_reset(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+    )
 }

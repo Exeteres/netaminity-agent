@@ -40,7 +40,7 @@ enum Command {
         #[clap(long, default_value_t = 7835, env = "BORE_CONTROL_PORT")]
         control_port: u16,
 
-        /// Enable tunnel integrity checks and restart behavior.
+        /// Enable health checks and automatic session recovery.
         #[clap(long)]
         reliable: bool,
 
@@ -75,7 +75,7 @@ enum Command {
         #[clap(long, default_value_t = 7835, env = "BORE_CONTROL_PORT")]
         control_port: u16,
 
-        /// Enable tunnel integrity checks and restart behavior.
+        /// Enable health checks and automatic session recovery.
         #[clap(long)]
         reliable: bool,
 
@@ -109,16 +109,26 @@ async fn run_command(command: Command) -> Result<()> {
             reliable,
             health_addr,
         } => {
-            let mut client = Client::new(
-                &local_host,
-                local_port,
-                &to,
-                port,
-                secret.as_deref(),
-                control_port,
-            )
-            .await?;
-            client.set_reliable(reliable);
+            let mut client = if reliable {
+                Client::new_reliable(
+                    &local_host,
+                    local_port,
+                    &to,
+                    port,
+                    secret.as_deref(),
+                    control_port,
+                )
+            } else {
+                Client::new(
+                    &local_host,
+                    local_port,
+                    &to,
+                    port,
+                    secret.as_deref(),
+                    control_port,
+                )
+                .await?
+            };
             if let Some(addr) = health_addr {
                 client.set_health_addr(addr);
             }

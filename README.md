@@ -14,20 +14,20 @@ Refer to the upstream repository for the original project documentation and base
 
 ## Versions
 
-Fork releases use the version format `{original-version}-na.{counter}`. Current version: `0.6.0-na.2`
+Fork releases use the version format `{original-version}-na.{counter}`. Current version: `0.6.0-na.4`
 
 ## Images
 
 Container image:
 
 ```shell
-ghcr.io/exeteres/netaminity-agent:0.6.0-na.2
+ghcr.io/exeteres/netaminity-agent:0.6.0-na.4
 ```
 
 Run the image:
 
 ```shell
-docker run -it --init --rm --network host ghcr.io/exeteres/netaminity-agent:0.6.0-na.2 <ARGS>
+docker run -it --init --rm --network host ghcr.io/exeteres/netaminity-agent:0.6.0-na.4 <ARGS>
 ```
 
 Release images are built by `.github/workflows/docker.yml` for tags matching `v*.*.*-na.*`.

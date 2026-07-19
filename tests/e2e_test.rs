@@ -1,13 +1,17 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use bore_cli::{client::Client, server::Server, shared::DEFAULT_CONTROL_PORT};
+use anyhow::{anyhow, Context, Result};
+use bore_cli::{
+    client::Client,
+    server::Server,
+    shared::{ClientMessage, Delimited, ServerMessage, DEFAULT_CONTROL_PORT},
+};
 use lazy_static::lazy_static;
 use rstest::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tokio::time;
 
 lazy_static! {
@@ -60,7 +64,7 @@ async fn http_status(port: u16, path: &str) -> Result<u16> {
 }
 
 async fn wait_for_status(port: u16, path: &str, expected: u16) -> Result<()> {
-    time::timeout(Duration::from_secs(10), async {
+    time::timeout(Duration::from_secs(20), async {
         loop {
             if matches!(http_status(port, path).await, Ok(status) if status == expected) {
                 return;
@@ -250,16 +254,102 @@ async fn reliable_health_distinguishes_backend_failure() -> Result<()> {
     client.set_health_addr(([127, 0, 0, 1], target_health_port).into());
     let client_task = tokio::spawn(client.listen());
 
-    wait_for_status(proxy_health_port, "/ready", 200).await?;
-    wait_for_status(target_health_port, "/ready", 200).await?;
+    wait_for_status(proxy_health_port, "/ready", 200)
+        .await
+        .context("proxy did not become ready")?;
+    wait_for_status(target_health_port, "/ready", 200)
+        .await
+        .context("target did not become ready")?;
 
     backend_task.abort();
-    wait_for_status(proxy_health_port, "/ready", 503).await?;
-    wait_for_status(target_health_port, "/ready", 503).await?;
+    wait_for_status(proxy_health_port, "/ready", 503)
+        .await
+        .context("proxy did not observe backend failure")?;
+    wait_for_status(target_health_port, "/ready", 503)
+        .await
+        .context("target did not observe backend failure")?;
     assert_eq!(http_status(proxy_health_port, "/live").await?, 200);
     assert_eq!(http_status(target_health_port, "/live").await?, 200);
 
     client_task.abort();
     server_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn reliable_target_reconnects_in_process() -> Result<()> {
+    let _guard = SERIAL_GUARD.lock().await;
+    let control_port = unused_port().await?;
+    let proxy_port = unused_port().await?;
+    let target_health_port = unused_port().await?;
+    let backend = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend.local_addr()?.port();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = backend.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut value = [0; 4];
+                if stream.read_exact(&mut value).await.is_ok() {
+                    let _ = stream.write_all(&value).await;
+                }
+            });
+        }
+    });
+    let (reconnected, reconnected_rx) = oneshot::channel();
+    let (finish, finish_rx) = oneshot::channel();
+    let mut client = Client::new_reliable(
+        "127.0.0.1",
+        backend_port,
+        "127.0.0.1",
+        proxy_port,
+        None,
+        control_port,
+    );
+    client.set_health_addr(([127, 0, 0, 1], target_health_port).into());
+    let client_task = tokio::spawn(client.listen());
+
+    wait_for_status(target_health_port, "/live", 200).await?;
+    assert_eq!(http_status(target_health_port, "/ready").await?, 503);
+    assert!(!client_task.is_finished());
+
+    let peer_task = tokio::spawn(async move {
+        let control_listener = TcpListener::bind(("127.0.0.1", control_port)).await?;
+        let mut reconnected = Some(reconnected);
+        let mut finish_rx = Some(finish_rx);
+        for session in 0..2 {
+            let (stream, _) = control_listener.accept().await?;
+            let mut stream = Delimited::new(stream);
+            match stream.recv_timeout().await? {
+                Some(ClientMessage::Hello(port)) if port == proxy_port => {}
+                message => return Err(anyhow!("unexpected hello: {message:?}")),
+            }
+            stream.send(ServerMessage::Hello(proxy_port)).await?;
+            let nonce = uuid::Uuid::new_v4();
+            stream.send(ServerMessage::HealthCheck(nonce)).await?;
+            match stream.recv_timeout().await? {
+                Some(ClientMessage::Health(response_nonce, _)) if response_nonce == nonce => {}
+                message => return Err(anyhow!("unexpected health response: {message:?}")),
+            }
+            if session == 0 {
+                drop(stream);
+            } else {
+                let _ = reconnected.take().unwrap().send(());
+                let _ = finish_rx.take().unwrap().await;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    time::timeout(Duration::from_secs(10), reconnected_rx).await??;
+    wait_for_status(target_health_port, "/ready", 200).await?;
+    assert!(!client_task.is_finished());
+    assert_eq!(http_status(target_health_port, "/live").await?, 200);
+
+    let _ = finish.send(());
+    peer_task.await??;
+    client_task.abort();
+    backend_task.abort();
     Ok(())
 }

@@ -59,7 +59,7 @@ impl HealthState {
         self.tunnel_verified.store(verified, Ordering::Relaxed);
     }
 
-    /// Mark the process unhealthy enough to restart.
+    /// Mark the local process supervisor unhealthy.
     pub fn fail_liveness(&self) {
         self.live.store(false, Ordering::Relaxed);
     }
@@ -162,13 +162,14 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_failure_fails_liveness() {
+    fn session_health_does_not_change_liveness() {
         let health = HealthState::new();
         health.set_control_connected(true);
         health.set_backend_reachable(true);
         health.set_tunnel_verified(true);
-        health.fail_liveness();
+        health.set_control_connected(false);
 
-        assert!(!health.is_live());
+        assert!(health.is_live());
+        assert!(!health.proxy_ready());
     }
 }
