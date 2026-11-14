@@ -15,7 +15,7 @@ use crate::auth::Authenticator;
 use crate::health::{serve as serve_health, HealthState};
 use crate::shared::{
     ClientMessage, Delimited, ServerMessage, BACKEND_CHECK_INTERVAL, CONNECTION_ATTEMPT_TIMEOUT,
-    CONNECT_TIMEOUT,
+    CONNECT_TIMEOUT, CONTROL_IDLE_TIMEOUT, NETWORK_TIMEOUT,
 };
 
 const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(10);
@@ -218,6 +218,9 @@ impl Client {
             let established_at = tokio::time::Instant::now();
             let result = this.run_session(&mut active_conn).await;
             this.health.set_control_connected(false);
+            // Release the old socket before dialing: a live but stalled Proxy
+            // may still own the requested listener until it observes this EOF.
+            drop(active_conn);
 
             if !this.reliable {
                 return result;
@@ -264,23 +267,29 @@ impl Client {
 
     async fn run_session(self: &Arc<Self>, conn: &mut Delimited<TcpStream>) -> Result<()> {
         let mut tasks = JoinSet::new();
+        let mut idle_deadline = tokio::time::Instant::now() + CONTROL_IDLE_TIMEOUT;
         loop {
-            let message = match conn.recv().await {
-                Ok(message) => message,
-                Err(err) => {
-                    return Err(err);
-                }
+            let message = if self.reliable {
+                tokio::time::timeout_at(idle_deadline, conn.recv())
+                    .await
+                    .context("proxy control session silent beyond heartbeat deadline")??
+            } else {
+                conn.recv().await?
             };
+            idle_deadline = tokio::time::Instant::now() + CONTROL_IDLE_TIMEOUT;
             match message {
                 Some(ServerMessage::Hello(_)) => warn!("unexpected hello"),
                 Some(ServerMessage::Challenge(_)) => warn!("unexpected challenge"),
                 Some(ServerMessage::Heartbeat) => (),
                 Some(ServerMessage::HealthCheck(nonce)) => {
-                    conn.send(ClientMessage::Health(
-                        nonce,
-                        self.health.backend_reachable(),
-                    ))
-                    .await?;
+                    let response = ClientMessage::Health(nonce, self.health.backend_reachable());
+                    if self.reliable {
+                        timeout(NETWORK_TIMEOUT, conn.send(response))
+                            .await
+                            .context("timed out sending control health response")??;
+                    } else {
+                        conn.send(response).await?;
+                    }
                 }
                 Some(ServerMessage::TunnelProbe(id)) => {
                     let this = Arc::clone(self);
