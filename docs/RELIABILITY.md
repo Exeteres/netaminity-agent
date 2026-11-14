@@ -92,6 +92,15 @@ Fast retries only help after the agent detects that the established session is n
 - A heartbeat response timeout is bounded so a silent connection is detected in approximately 4 to 6 seconds.
 - Backend DNS and connection latency do not block heartbeat responses.
 
+The Target independently bounds control-message silence to 15 seconds in reliable
+mode. This permits three health-check cycles including full tunnel-probe timeouts,
+but closes a silent established TCP session even if the Proxy cannot report its
+own failure. A health-response write is bounded to three seconds as well. Any
+valid control message refreshes the silence deadline; idle application streams do
+not need to send data. This requires no new protocol messages and also works with
+legacy Proxies, which send a heartbeat every 500 milliseconds. Standard Targets
+without `--reliable` retain their original behavior.
+
 Once the session is declared lost, the Target marks itself unready and begins the reconnect sequence immediately. The Proxy clears that session's readiness and tunnel-verification state while continuing to accept a replacement session.
 
 ## Backend And Tunnel Checks
@@ -131,7 +140,7 @@ The agent-level objectives are:
 | --- | --- | --- |
 | Explicit control EOF, reset, or protocol error | Immediate when observed | Mark unready and reconnect immediately. If the peer is available, recovery is normally below 1 second. |
 | Peer becomes available during an outage | At the next attempt | Reconnect within 2 seconds when connects fail quickly. |
-| Silent established connection failure | Approximately 4 to 6 seconds | End the session and enter immediate reconnect. |
+| Silent established connection failure | Proxy: approximately 4 to 6 seconds; Target: at most 15 seconds without a control message (or 3 seconds for a blocked health-response write) | End the session and enter immediate reconnect. |
 | Blackholed endpoint | At most 3 seconds per attempt | Continue retrying with at most 2 seconds between attempts. |
 | Temporary authentication mismatch | One failed handshake | Remain live and retry, capped at a 2-second delay. |
 | Backend becomes unavailable | One backend check and timeout, at most 8 seconds | Mark both sides unready as state propagates and retain the control session. |

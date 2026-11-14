@@ -5,7 +5,10 @@ use anyhow::{anyhow, Context, Result};
 use bore_cli::{
     client::Client,
     server::Server,
-    shared::{ClientMessage, Delimited, ServerMessage, DEFAULT_CONTROL_PORT},
+    shared::{
+        ClientMessage, Delimited, ServerMessage, CONTROL_IDLE_TIMEOUT, DEFAULT_CONTROL_PORT,
+        HEALTH_CHECK_INTERVAL,
+    },
 };
 use lazy_static::lazy_static;
 use rstest::*;
@@ -350,6 +353,140 @@ async fn reliable_target_reconnects_in_process() -> Result<()> {
     let _ = finish.send(());
     peer_task.await??;
     client_task.abort();
+    backend_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn reliable_target_recovers_from_silent_control_peer() -> Result<()> {
+    let control = TcpListener::bind("127.0.0.1:0").await?;
+    let control_port = control.local_addr()?.port();
+    let health_port = unused_port().await?;
+    let backend = TcpListener::bind("127.0.0.1:0").await?;
+    let mut client = Client::new_reliable(
+        "127.0.0.1",
+        backend.local_addr()?.port(),
+        "127.0.0.1",
+        12345,
+        None,
+        control_port,
+    );
+    client.set_health_addr(([127, 0, 0, 1], health_port).into());
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let _ = backend.accept().await?;
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+    let client_task = tokio::spawn(client.listen());
+    let (stream, _) = time::timeout(Duration::from_secs(3), control.accept()).await??;
+    let mut silent_peer = Delimited::new(stream);
+    assert!(matches!(
+        silent_peer.recv_timeout().await?,
+        Some(ClientMessage::Hello(12345))
+    ));
+    silent_peer.send(ServerMessage::Hello(12345)).await?;
+    wait_for_status(health_port, "/ready", 200).await?;
+
+    // Keep the socket open and ACKing TCP, but never send another protocol
+    // message. TCP keepalive alone cannot detect this stalled application peer.
+    let (replacement, _) = time::timeout(
+        CONTROL_IDLE_TIMEOUT + Duration::from_secs(3),
+        control.accept(),
+    )
+    .await??;
+    assert_eq!(http_status(health_port, "/ready").await?, 503);
+    assert_eq!(http_status(health_port, "/live").await?, 200);
+    assert!(
+        time::timeout(Duration::from_secs(1), silent_peer.recv::<ClientMessage>())
+            .await??
+            .is_none()
+    );
+
+    // The same process restores readiness after the new session authenticates.
+    let mut replacement = Delimited::new(replacement);
+    assert!(matches!(
+        replacement.recv_timeout().await?,
+        Some(ClientMessage::Hello(12345))
+    ));
+    replacement.send(ServerMessage::Hello(12345)).await?;
+    let nonce = uuid::Uuid::new_v4();
+    replacement.send(ServerMessage::HealthCheck(nonce)).await?;
+    assert!(matches!(
+        replacement.recv_timeout().await?,
+        Some(ClientMessage::Health(response, true)) if response == nonce
+    ));
+    wait_for_status(health_port, "/ready", 200).await?;
+    assert!(!client_task.is_finished());
+    client_task.abort();
+    backend_task.abort();
+    Ok(())
+}
+
+#[rstest]
+#[tokio::test]
+async fn reliable_target_retains_idle_session_and_stream(
+    #[values(false, true)] reliable_proxy: bool,
+) -> Result<()> {
+    let control_port = unused_port().await?;
+    let proxy_port = unused_port().await?;
+    let health_port = unused_port().await?;
+    let backend = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend.local_addr()?.port();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = backend.accept().await?;
+            tokio::spawn(async move {
+                let (mut read, mut write) = stream.split();
+                tokio::io::copy(&mut read, &mut write).await
+            });
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+    let mut server = Server::new(proxy_port..=proxy_port, None);
+    server.set_bind_addr("127.0.0.1".parse()?);
+    server.set_bind_tunnels("127.0.0.1".parse()?);
+    server.set_control_port(control_port);
+    server.set_reliable(reliable_proxy);
+    let server_task = tokio::spawn(server.listen());
+    let mut client = Client::new_reliable(
+        "127.0.0.1",
+        backend_port,
+        "127.0.0.1",
+        proxy_port,
+        None,
+        control_port,
+    );
+    client.set_health_addr(([127, 0, 0, 1], health_port).into());
+    let client_task = tokio::spawn(client.listen());
+    wait_for_status(health_port, "/ready", 200).await?;
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    stream.write_all(b"before").await?;
+    let mut echo = [0; 6];
+    time::timeout(Duration::from_secs(5), stream.read_exact(&mut echo)).await??;
+    assert_eq!(&echo, b"before");
+
+    // No application data or new consumers for longer than the watchdog.
+    // Retaining this exact data connection proves the session was not replaced:
+    // run_session drops (and aborts) its forwarding JoinSet on session loss.
+    let until = time::Instant::now() + CONTROL_IDLE_TIMEOUT + HEALTH_CHECK_INTERVAL;
+    while time::Instant::now() < until {
+        assert_eq!(http_status(health_port, "/ready").await?, 200);
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    stream.write_all(b"after!").await?;
+    time::timeout(Duration::from_secs(5), stream.read_exact(&mut echo)).await??;
+    assert_eq!(&echo, b"after!");
+
+    // New application work is still accepted through the same control session.
+    let mut new_stream = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    new_stream.write_all(b"new!!!").await?;
+    time::timeout(Duration::from_secs(5), new_stream.read_exact(&mut echo)).await??;
+    assert_eq!(&echo, b"new!!!");
+    client_task.abort();
+    server_task.abort();
     backend_task.abort();
     Ok(())
 }

@@ -32,6 +32,14 @@ pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 /// Interval between reliability checks.
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Maximum silence from a Proxy in reliable Target mode.
+///
+/// Reliable Proxies send health checks even without application traffic. Allow
+/// three check cycles, each including a full tunnel-probe timeout. Legacy
+/// Proxies also send unsolicited heartbeats every 500 milliseconds.
+pub const CONTROL_IDLE_TIMEOUT: Duration =
+    Duration::from_secs(3 * (HEALTH_CHECK_INTERVAL.as_secs() + NETWORK_TIMEOUT.as_secs()));
+
 /// Interval between direct Target backend checks.
 pub const BACKEND_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
